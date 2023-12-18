@@ -1,6 +1,5 @@
 package com.example.demo.controller;
 
-import com.example.demo.exceptions.CustomWebSocketException;
 import org.springframework.stereotype.Component;
 import org.springframework.web.socket.CloseStatus;
 import org.springframework.web.socket.TextMessage;
@@ -8,136 +7,126 @@ import org.springframework.web.socket.WebSocketSession;
 import org.springframework.web.socket.handler.TextWebSocketHandler;
 
 import java.io.IOException;
-import java.nio.file.Files;
-import java.nio.file.Paths;
-import java.util.List;
+import java.io.RandomAccessFile;
+import java.nio.file.*;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.Set;
 
 @Component
 public class MyWebSocketHandler extends TextWebSocketHandler {
 
-    private static final String FILE_NAME = "/home/gunsvb/Desktop/sonar.txt"; // Use a shared location accessible by all processes
-    private final Object lock = new Object(); // Object for synchronization
+    private static final Path FILE_PATH = Paths.get("/home/gunsvb/Desktop/sonar.txt");
+    private long lastFilePosition = 0;
+    private final Object lock = new Object();
+    private Set<WebSocketSession> sessions = Collections.synchronizedSet(new HashSet<>());
 
-    private boolean isFirstMessage(WebSocketSession session) {
-        Object attribute = session.getAttributes().get("isFirstMessage");
-        return attribute == null || (boolean) attribute;
-    }
-
-    private void setNotFirstMessage(WebSocketSession session) {
-        session.getAttributes().put("isFirstMessage", false);
-    }
-
-    private void sendFileContent(WebSocketSession session) {
+    public MyWebSocketHandler() {
         try {
-            String fileContent = String.join("\n", Files.readAllLines(Paths.get(FILE_NAME)));
-            session.sendMessage(new TextMessage(fileContent));
-        } catch (IOException e) {
-            System.err.println("Error sending file content: " + e.getMessage());
-        }
-    }
+            // Register directory with WatchService for file modification events
+            Path parentDirectory = FILE_PATH.getParent();
+            WatchService watchService = FileSystems.getDefault().newWatchService();
+            parentDirectory.register(watchService, StandardWatchEventKinds.ENTRY_MODIFY);
 
-    private void checkForFileChanges(WebSocketSession session) {
-        try {
-            synchronized (lock) {
-                if (isFirstMessage(session)) {
-                    setFileLines(session, Files.readAllLines(Paths.get(FILE_NAME)));
-                    sendFileContent(session);
-                    setNotFirstMessage(session);
-                }
-
-                Thread thread = new Thread(() -> {
-
+            // Start a separate thread for handling file modification events
+            Thread thread = new Thread(() -> {
+                try {
                     while (true) {
-                        try {
-                            long currentModifiedTime = Files.getLastModifiedTime(Paths.get(FILE_NAME)).toMillis();
-                            if (currentModifiedTime > getLastModifiedTime(session)) {
-                                List<String> newLines = getNewLines(session, getFileLines(session));
-                                if (!newLines.isEmpty()) {
-                                    String newData = String.join("\n", newLines);
-                                    try {
-                                        session.sendMessage(new TextMessage(newData));
-                                    } catch (IOException e) {
-                                        System.err.println("Error sending message: " + e.getMessage());
-                                    }
-                                }
-                                setLastModifiedTime(session, currentModifiedTime);
+                        WatchKey key = watchService.take();
+                        for (WatchEvent<?> event : key.pollEvents()) {
+                            if (event.kind() == StandardWatchEventKinds.OVERFLOW) {
+                                continue;
                             }
-                        } catch (IOException e) {
-                            System.err.println("Error reading file: " + e.getMessage());
+                            if (event.kind() == StandardWatchEventKinds.ENTRY_MODIFY) {
+                                notifyClientsAboutFileChange();
+                            }
                         }
-
-                        try {
-                            Thread.sleep(1000); // Adjust the sleep duration as needed
-                        } catch (InterruptedException e) {
-                            Thread.currentThread().interrupt();
-                            break;
-                        }
+                        key.reset();
                     }
-                });
-
-                thread.start();
-            }
-        } catch (Exception e) {
-            System.err.println("Error initializing file: " + e.getMessage());
-        }
-    }
-
-    private long getLastModifiedTime(WebSocketSession session) {
-        Object attribute = session.getAttributes().get("lastModifiedTime");
-        return attribute == null ? 0L : (long) attribute;
-    }
-
-    private void setLastModifiedTime(WebSocketSession session, long value) {
-        session.getAttributes().put("lastModifiedTime", value);
-    }
-
-
-    private List<String> getNewLines(WebSocketSession session, List<String> fileLines) {
-        try {
-            List<String> currentLines = Files.readAllLines(Paths.get(FILE_NAME));
-            int startIndex = 0;
-            if (fileLines.size() < currentLines.size()) {
-                startIndex = fileLines.size();
-            }
-
-            List<String> newLines = currentLines.subList(startIndex, currentLines.size());
-            fileLines = currentLines;
-            setFileLines(session, fileLines);
-            return newLines;
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                }
+            });
+            thread.start();
         } catch (IOException e) {
-            System.err.println("Error reading file lines: " + e.getMessage());
-            return List.of();
+            e.printStackTrace();
         }
     }
 
-    private List<String> getFileLines(WebSocketSession session) {
-        Object attribute = session.getAttributes().get("fileLines");
-        return attribute == null ? List.of() : (List<String>) attribute;
+    private void notifyClientsAboutFileChange() {
+        String newLines = readNewLines();
+        if (!newLines.isEmpty()) {
+            synchronized (sessions) {
+                for (WebSocketSession session : sessions) {
+                    try {
+                        session.sendMessage(new TextMessage(newLines));
+                    } catch (IOException e) {
+                        handleWebSocketException(session, "Error sending message: " + e.getMessage());
+                    }
+                }
+            }
+        }
     }
 
-    private void setFileLines(WebSocketSession session, List<String> lines) {
-        session.getAttributes().put("fileLines", lines);
+    private String readNewLines() {
+        StringBuilder newLines = new StringBuilder();
+        try (RandomAccessFile randomAccessFile = new RandomAccessFile(FILE_PATH.toFile(), "r")) {
+            synchronized (lock) {
+                randomAccessFile.seek(lastFilePosition);
+
+                String line;
+                while ((line = randomAccessFile.readLine()) != null) {
+                    newLines.append(line).append("\n");
+                }
+                lastFilePosition = randomAccessFile.getFilePointer();
+            }
+        } catch (IOException e) {
+            handleFileIOException(e);
+        }
+        return newLines.toString().trim();
+    }
+
+    private void handleFileIOException(IOException e) {
+        System.err.println("Error reading file: " + e.getMessage());
+    }
+
+    private void handleWebSocketException(WebSocketSession session, String errorMessage) {
+        try {
+            String errorEvent = String.format("{\"event\":\"error\",\"message\":\"%s\"}", errorMessage);
+            session.sendMessage(new TextMessage(errorEvent));
+        } catch (IOException e) {
+            System.err.println("Error sending WebSocket error event: " + e.getMessage());
+        }
+    }
+
+    @Override
+    public void handleTextMessage(WebSocketSession session, TextMessage message) throws IOException {
+        System.out.println("Received message: " + message.getPayload());
+        sessions.add(session);
+        sendInitialFileContent(session);
+    }
+    private void sendInitialFileContent(WebSocketSession session) {
+        try (RandomAccessFile randomAccessFile = new RandomAccessFile(FILE_PATH.toFile(), "r")) {
+            StringBuilder initialContent = new StringBuilder();
+            for (int i = 0; i < 100; i++) {
+                String line = randomAccessFile.readLine();
+                if (line == null) {
+                    break;  // Break if we reach the end of the file
+                }
+                initialContent.append(line).append("\n");
+            }
+            session.sendMessage(new TextMessage(initialContent.toString()));
+        } catch (IOException e) {
+            handleFileIOException(e);
+        }
     }
 
     @Override
     public void afterConnectionClosed(WebSocketSession session, CloseStatus status) throws Exception {
         super.afterConnectionClosed(session, status);
-        session.getAttributes().put("isFirstMessage", true); // Reset isFirstMessage on connection close
-        // Perform cleanup or additional logic when a connection is closed
+        synchronized (sessions) {
+            sessions.remove(session);
+        }
         System.out.println("Connection closed: " + session.getId());
-    }
-
-    @Override
-    protected void handleTextMessage(WebSocketSession session, TextMessage message) throws IOException {
-        System.out.println("Received message: " + message.getPayload());
-        checkForFileChanges(session);
-    }
-
-    private void handleException(WebSocketSession session, CustomWebSocketException e) {
-        // Log the exception details
-        System.err.println("Exception occurred: " + e.getMessage());
-
-        // Send an error message to the WebSocket session
-        sendErrorMessage(session, "ERROR: " + e.getMessage());
     }
 }
